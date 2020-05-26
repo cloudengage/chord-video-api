@@ -839,9 +839,6 @@ JitsiConference.prototype.removeCommand = function(name) {
  */
 JitsiConference.prototype.setDisplayName = function(name) {
     if (this.room) {
-        // remove previously set nickname
-        this.room.removeFromPresence('nick');
-
         this.room.addToPresence('nick', {
             attributes: { xmlns: 'http://jabber.org/protocol/nick' },
             value: name
@@ -1728,6 +1725,14 @@ JitsiConference.prototype.onCallAccepted = function(session, answer) {
     if (this.p2pJingleSession === session) {
         logger.info('P2P setAnswer');
 
+        // Apply pending video constraints.
+        if (this.pendingVideoConstraintsOnP2P) {
+            this.p2pJingleSession.setSenderVideoConstraint(this.maxFrameHeight)
+                .catch(err => {
+                    logger.error(`Sender video constraints failed on p2p session - ${err}`);
+                });
+        }
+
         // Setup E2EE.
         const localTracks = this.getLocalTracks();
 
@@ -2296,7 +2301,6 @@ JitsiConference.prototype.setStartMutedPolicy = function(policy) {
         return;
     }
     this.startMutedPolicy = policy;
-    this.room.removeFromPresence('startmuted');
     this.room.addToPresence('startmuted', {
         attributes: {
             audio: policy.audio,
