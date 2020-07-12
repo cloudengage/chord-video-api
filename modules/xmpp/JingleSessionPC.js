@@ -282,6 +282,8 @@ export default class JingleSessionPC extends JingleSession {
                 XmppConnection.Events.CONN_STATUS_CHANGED,
                 this.onXmppStatusChanged.bind(this))
         );
+
+        this._removeSenderVideoConstraintsChangeListener = undefined;
     }
 
     /* eslint-enable max-params */
@@ -341,7 +343,6 @@ export default class JingleSessionPC extends JingleSession {
                 = options.disableSimulcast
                     || (options.preferH264 && !options.disableH264);
             pcOptions.preferH264 = options.preferH264;
-            pcOptions.enableLayerSuspension = options.enableLayerSuspension;
 
             // disable simulcast for screenshare and set the max bitrate to
             // 500Kbps if the testing flag is present in config.js.
@@ -577,19 +578,12 @@ export default class JingleSessionPC extends JingleSession {
 
         if (!this.isP2P && options.enableLayerSuspension) {
             // If this is the bridge session, we'll listen for
-            // IS_SELECTED_CHANGED events and notify the peer connection
-            this.rtc.addListener(RTCEvents.IS_SELECTED_CHANGED,
-                isSelected => {
-                    this.peerconnection.setIsSelected(isSelected);
-                    logger.info('Doing local O/A due to '
-                        + 'IS_SELECTED_CHANGED event');
-                    this.modificationQueue.push(finishedCallback => {
-                        this._renegotiate()
-                            .then(finishedCallback)
-                            .catch(finishedCallback);
-                    });
-                }
-            );
+            // SENDER_VIDEO_CONSTRAINTS_CHANGED events and notify the peer connection
+            this._removeSenderVideoConstraintsChangeListener = this.rtc.addListener(
+                RTCEvents.SENDER_VIDEO_CONSTRAINTS_CHANGED, () => {
+                    this.eventEmitter.emit(
+                        MediaSessionEvents.REMOTE_VIDEO_CONSTRAINTS_CHANGED, this);
+                });
         }
     }
 
@@ -599,9 +593,11 @@ export default class JingleSessionPC extends JingleSession {
      * @returns {Number|undefined}
      */
     getRemoteRecvMaxFrameHeight() {
-        return this.isP2P
-            ? this.remoteRecvMaxFrameHeight
-            : undefined; // FIXME George: put a getter for the JVB's preference here
+        if (this.isP2P) {
+            return this.remoteRecvMaxFrameHeight;
+        }
+
+        return this.options.enableLayerSuspension ? this.rtc.getSenderVideoConstraints().idealHeight : undefined;
     }
 
     /**
@@ -1411,6 +1407,17 @@ export default class JingleSessionPC extends JingleSession {
     }
 
     /**
+     * Sets the degradation preference on the video sender. This setting determines if
+     * resolution or framerate will be preferred when bandwidth or cpu is constrained.
+     * @returns {void}
+     */
+    setSenderVideoDegradationPreference() {
+        if (this._assertNotEnded()) {
+            this.peerconnection.setSenderVideoDegradationPreference();
+        }
+    }
+
+    /**
      * @inheritDoc
      */
     terminate(success, failure, options) {
@@ -1468,6 +1475,10 @@ export default class JingleSessionPC extends JingleSession {
 
         this._xmppListeners.forEach(removeListener => removeListener());
         this._xmppListeners = [];
+
+        if (this._removeSenderVideoConstraintsChangeListener) {
+            this._removeSenderVideoConstraintsChangeListener();
+        }
 
         this.close();
     }
@@ -1882,15 +1893,18 @@ export default class JingleSessionPC extends JingleSession {
                         finishedCallback /* will be called with en error */);
                     }
 
-                    // Wait for the renegotation to be done if needed (plan-b) before adjusting
-                    // the max bitrates on the video sender.
                     promise.then(() => {
-                        // configure max bitrate only when media is routed
-                        // through JVB. For p2p case, browser takes care of
-                        // adjusting the uplink based on the feedback it
-                        // gets from the peer.
-                        if (newTrack && !this.isP2P) {
-                            this.peerconnection.setMaxBitRate(newTrack);
+                        if (newTrack && newTrack.isVideoTrack()) {
+                            // Set the degradation preference on the new video sender.
+                            this.peerconnection.setSenderVideoDegradationPreference();
+
+                            // Apply the cached video constraints on the new video sender.
+                            this.peerconnection.setSenderVideoConstraint();
+
+                            // Configure max bitrate on the video sender when media is routed through JVB.
+                            if (!this.isP2P) {
+                                this.peerconnection.setMaxBitRate(newTrack);
+                            }
                         }
                         finishedCallback();
                     }, finishedCallback /* will be called with en error */);
@@ -2038,7 +2052,15 @@ export default class JingleSessionPC extends JingleSession {
      */
     addTrackAsUnmute(track) {
         return this._addRemoveTrackAsMuteUnmute(
-            false /* add as unmute */, track);
+            false /* add as unmute */, track)
+            .then(() => {
+                // Apply the video constraints and degradation preference on
+                // the video sender if needed.
+                if (track.isVideoTrack() && browser.doesVideoMuteByStreamRemove()) {
+                    this.peerconnection.setSenderVideoDegradationPreference();
+                    this.peerconnection.setSenderVideoConstraint();
+                }
+            });
     }
 
     /**
@@ -2213,9 +2235,7 @@ export default class JingleSessionPC extends JingleSession {
             logger.info(`${this} received remote max frame height: ${newMaxFrameHeight}`);
             this.remoteRecvMaxFrameHeight = newMaxFrameHeight;
             this.eventEmitter.emit(
-                MediaSessionEvents.REMOTE_VIDEO_CONSTRAINTS_CHANGED,
-                this,
-                newMaxFrameHeight);
+                MediaSessionEvents.REMOTE_VIDEO_CONSTRAINTS_CHANGED, this);
         }
 
         if (newVideoSenders === null) {

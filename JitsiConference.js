@@ -23,15 +23,14 @@ import * as DetectionEvents from './modules/detection/DetectionEvents';
 import NoAudioSignalDetection from './modules/detection/NoAudioSignalDetection';
 import browser from './modules/browser';
 import ConnectionQuality from './modules/connectivity/ConnectionQuality';
-import IceFailedNotification
-    from './modules/connectivity/IceFailedNotification';
+import IceFailedHandling
+    from './modules/connectivity/IceFailedHandling';
 import ParticipantConnectionStatusHandler
     from './modules/connectivity/ParticipantConnectionStatus';
 import E2EEContext from './modules/e2ee/E2EEContext';
 import E2ePing from './modules/e2eping/e2eping';
 import Jvb121EventGenerator from './modules/event/Jvb121EventGenerator';
 import RecordingManager from './modules/recording/RecordingManager';
-import RttMonitor from './modules/rttmonitor/rttmonitor';
 import Settings from './modules/settings/Settings';
 import AvgRTPStatsReporter from './modules/statistics/AvgRTPStatsReporter';
 import AudioOutputProblemDetector from './modules/statistics/AudioOutputProblemDetector';
@@ -238,7 +237,9 @@ export default function JitsiConference(options) {
     this.recordingManager = new RecordingManager(this.room);
     this._conferenceJoinAnalyticsEventSent = false;
 
-    if (browser.supportsInsertableStreams()) {
+    const config = this.options.config;
+
+    if (browser.supportsInsertableStreams() && !(config.testing && config.testing.disableE2EE)) {
         this._e2eeCtx = new E2EEContext({ salt: this.options.name });
     }
 }
@@ -331,8 +332,6 @@ JitsiConference.prototype._init = function(options = {}) {
 
     this._sendConferenceJoinAnalyticsEvent = this._sendConferenceJoinAnalyticsEvent.bind(this);
     this.room.addListener(XMPPEvents.MEETING_ID_SET, this._sendConferenceJoinAnalyticsEvent);
-
-    this.rttMonitor = new RttMonitor(config.rttMonitor || {});
 
     this.e2eping = new E2ePing(
         this,
@@ -540,11 +539,6 @@ JitsiConference.prototype.leave = function() {
     if (this._audioOutputProblemDetector) {
         this._audioOutputProblemDetector.dispose();
         this._audioOutputProblemDetector = null;
-    }
-
-    if (this.rttMonitor) {
-        this.rttMonitor.stop();
-        this.rttMonitor = null;
     }
 
     if (this.e2eping) {
@@ -1421,6 +1415,19 @@ JitsiConference.prototype.getParticipantCount
  */
 JitsiConference.prototype.getParticipantById = function(id) {
     return this.participants[id];
+};
+
+/**
+ * Grant owner rights to the participant.
+ * @param {string} id id of the participant to grant owner rights to.
+ */
+JitsiConference.prototype.grantOwner = function(id) {
+    const participant = this.getParticipantById(id);
+
+    if (!participant) {
+        return;
+    }
+    this.room.setAffiliation(participant.getJid(), 'owner');
 };
 
 /**
@@ -2638,23 +2645,8 @@ JitsiConference.prototype._onIceConnectionFailed = function(session) {
         }
         this._stopP2PSession('connectivity-error', 'ICE FAILED');
     } else if (session && this.jvbJingleSession === session) {
-        if (!this.options.config.enableIceRestart) {
-            logger.info('ICE Failed and ICE restarts are disabled');
-            this.eventEmitter.emit(
-                JitsiConferenceEvents.CONFERENCE_FAILED,
-                JitsiConferenceErrors.ICE_FAILED);
-
-            return;
-        }
-
-        if (this.xmpp.isPingSupported()) {
-            this._delayedIceFailed = new IceFailedNotification(this);
-            this._delayedIceFailed.start(session);
-        } else {
-            // Let Jicofo know that the JVB's ICE connection has failed
-            logger.info('PING not supported - sending ICE failed immediately');
-            session.sendIceFailedNotification();
-        }
+        this._delayedIceFailed = new IceFailedHandling(this);
+        this._delayedIceFailed.start(session);
     }
 };
 
