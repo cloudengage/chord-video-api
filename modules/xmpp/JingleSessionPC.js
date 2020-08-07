@@ -1,11 +1,17 @@
 /* global __filename, $ */
 
+import { getLogger } from 'jitsi-meet-logger';
+import { $iq, Strophe } from 'strophe.js';
+
+import RTCEvents from '../../service/RTC/RTCEvents';
 import {
     ICE_DURATION,
     ICE_STATE_CHANGED
 } from '../../service/statistics/AnalyticsEvents';
-import { getLogger } from 'jitsi-meet-logger';
-import { $iq, Strophe } from 'strophe.js';
+import XMPPEvents from '../../service/xmpp/XMPPEvents';
+import Statistics from '../statistics/statistics';
+import AsyncQueue from '../util/AsyncQueue';
+import GlobalOnErrorHandler from '../util/GlobalOnErrorHandler';
 import { integerHash } from '../util/StringUtils';
 
 import browser from './../browser';
@@ -16,12 +22,6 @@ import SDP from './SDP';
 import SDPDiffer from './SDPDiffer';
 import SDPUtil from './SDPUtil';
 import SignalingLayerImpl from './SignalingLayerImpl';
-
-import RTCEvents from '../../service/RTC/RTCEvents';
-import Statistics from '../statistics/statistics';
-import XMPPEvents from '../../service/xmpp/XMPPEvents';
-import AsyncQueue from '../util/AsyncQueue';
-import GlobalOnErrorHandler from '../util/GlobalOnErrorHandler';
 import XmppConnection from './XmppConnection';
 
 const logger = getLogger(__filename);
@@ -47,6 +47,8 @@ const DEFAULT_MAX_STATS = 300;
  * @property {boolean} disableH264 - Described in the config.js[1].
  * @property {boolean} disableRtx - Described in the config.js[1].
  * @property {boolean} disableSimulcast - Described in the config.js[1].
+ * @property {boolean} enableInsertableStreams - Set to true when the insertable streams constraints is to be enabled
+ * on the PeerConnection.
  * @property {boolean} enableLayerSuspension - Described in the config.js[1].
  * @property {boolean} failICE - it's an option used in the tests. Set to
  * <tt>true</tt> to block any real candidates and make the ICE fail.
@@ -326,6 +328,9 @@ export default class JingleSessionPC extends JingleSession {
             pcOptions.maxstats = DEFAULT_MAX_STATS;
         }
         pcOptions.capScreenshareBitrate = false;
+        pcOptions.enableInsertableStreams = options.enableInsertableStreams;
+        pcOptions.videoQuality = options.videoQuality;
+
         if (this.isP2P) {
             // simulcast needs to be disabled for P2P (121) calls
             pcOptions.disableSimulcast = true;
@@ -1391,6 +1396,18 @@ export default class JingleSessionPC extends JingleSession {
     }
 
     /**
+     * Sets the maximum bitrates on the local video track if the current
+     * session is a JVB session. Bitrate values from videoQuality settings
+     * in config.js will be used for configuring the sender.
+     * @returns {void}
+     */
+    setSenderMaxBitrates() {
+        if (this._assertNotEnded() && !this.isP2P) {
+            return this.peerconnection.setMaxBitRate();
+        }
+    }
+
+    /**
      * Sets the resolution constraint on the local camera track.
      * @param {number} maxFrameHeight - The user preferred max frame height.
      * @returns {Promise} promise that will be resolved when the operation is
@@ -1438,13 +1455,26 @@ export default class JingleSessionPC extends JingleSession {
                         sid: this.sid
                     })
                     .c('reason')
-                    .c((options && options.reason) || 'success');
+                    .c((options && options.reason) || 'success')
+                    .up();
 
             if (options && options.reasonDescription) {
-                sessionTerminate.up()
+                sessionTerminate
                     .c('text')
-                    .t(options.reasonDescription);
+                    .t(options.reasonDescription)
+                    .up()
+                    .up();
+            } else {
+                sessionTerminate.up();
             }
+
+            this._bridgeSessionId
+                && sessionTerminate.c(
+                    'bridge-session', {
+                        xmlns: 'http://jitsi.org/protocol/focus',
+                        id: this._bridgeSessionId,
+                        restart: options && options.requestRestart === true
+                    }).up();
 
             // Calling tree() to print something useful
             sessionTerminate = sessionTerminate.tree();
@@ -2054,11 +2084,12 @@ export default class JingleSessionPC extends JingleSession {
         return this._addRemoveTrackAsMuteUnmute(
             false /* add as unmute */, track)
             .then(() => {
-                // Apply the video constraints and degradation preference on
+                // Apply the video constraints, max bitrates and degradation preference on
                 // the video sender if needed.
                 if (track.isVideoTrack() && browser.doesVideoMuteByStreamRemove()) {
-                    this.peerconnection.setSenderVideoDegradationPreference();
-                    this.peerconnection.setSenderVideoConstraint();
+                    this.setSenderMaxBitrates();
+                    this.setSenderVideoDegradationPreference();
+                    this.setSenderVideoConstraint();
                 }
             });
     }
